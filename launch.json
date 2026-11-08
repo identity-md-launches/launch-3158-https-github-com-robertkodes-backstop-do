@@ -1,0 +1,17 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "NightshiftBackstop",
+      "constructorArgs": [
+        "$owner",
+        "0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7",
+        "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+        "1000000000000000000000",
+        "10000000000",
+        "1000000000000000000"
+      ]
+    }
+  ],
+  "notes": "NightshiftBackstop implements discounted IMD exit offers and a USDC-funded Shield for the getnightshift.tech project on Ethereum. Constructor arguments, in declaration order, are the launch owner (also the initial treasury), existing IMD token, existing USDC quote token, minimum offer size of 1,000 IMD (18 decimals), Shield spending cap of 10,000 USDC per offer (6 decimals), and minimum bidder holding of 1 IMD. Offers remain unavailable until the owner sets a matching Uniswap v3 IMD/USDC price source with enough observation history for the 30-minute TWAP and one-hour momentum lookback. The owner can change the price source and treasury and pause new offers, bids and Shield deposits; settlement, claims and withdrawals remain available."
+}
