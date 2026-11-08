@@ -15,12 +15,13 @@ One contract is deployed: `src/NightshiftBackstop.sol`. It deploys no token, poo
 
 | Step | Who | What happens |
 |---|---|---|
-| `createOffer(amount)` | any seller | `amount` is rounded down to 100 equal lots (`LOTS_PER_OFFER`) and held in escrow. The price is frozen: `lotCost = ceil(lotSize × TWAP × (1 − discount))`. The offer cannot be cancelled. Bidding stays open for `OFFER_WINDOW` (1 h). |
-| `placeBid(offerId, lots)` | IMD holders | Each bid is 1–100 whole lots. The bidder locks `lots × lotCost` USDC. The bidder must hold at least `minBidderHolding` IMD when bidding. The seller cannot bid on their own offer. Late bids (`timestamp ≥ deadline`) are rejected. |
-| `settle(offerId)` | anyone, after the deadline | Needs no oracle and moves no funds. The Shield takes `s = min(50 lots, ⌊shieldPerOfferCap / lotCost⌋, ⌊50 % of Shield deposits / lotCost⌋)` lots. If the pump filter tripped at creation, `s` is 0. Bidders then fill `F = min(100 − s, total bid lots)`. Lots left over go back to the seller. |
-| `claimBid(bidId)` | bidder | Pays out the bid's filled lots in IMD and refunds the USDC for unfilled lots. |
-| `claimSeller(offerId)` | seller | Pays out `gross − 3 % fee` in USDC and returns any unabsorbed IMD. |
-| `shieldDeposit / shieldWithdraw / shieldClaimGains` | Shield depositors | Depositors put USDC into a pool. The pool buys its slice of each offer at the discounted price, and depositors earn 80 % of the fees. Withdrawals open 30 days after your latest deposit. Gains can be claimed at any time. |
+| `createOffer(amount, minLotCost, validUntil)` | any seller | `amount` is rounded down to 100 equal lots (`LOTS_PER_OFFER`) and held in escrow. The price is frozen: `lotCost = ceil(lotSize × TWAP × (1 − discount))`. The call reverts if `lotCost < minLotCost` (`LotCostBelowMinimum`) or if it is mined after `validUntil` (`OfferExpired`). The offer cannot be cancelled. Bidding stays open for `OFFER_WINDOW` (1 h). `createOffer(amount)` is the same call with no bound: it accepts whatever the pool reports in the mined block, so do not send it through a public mempool. |
+| (at creation) | the Shield | Unless the pump filter trips, the Shield **reserves** `r = min(50 lots, ⌊shieldPerOfferCap / lotCost⌋, ⌊(50 % of Shield deposits − quote already reserved for unsettled offers) / lotCost⌋)` lots. This is the most it will ever take from this offer. Deposits made later do not change it. |
+| `placeBid(offerId, lots)` | IMD holders | Each bid is 1–100 whole lots. The bidder locks `lots × lotCost` USDC. The bidder must hold at least `minBidderHolding` IMD when bidding. The seller cannot bid on their own offer. Late bids (`timestamp ≥ deadline`) are rejected. Bids are not pausable. |
+| `settle(offerId)` | anyone, after the deadline | Moves no funds. It reads the pool once more: the Shield buys its `r` reserved lots only if `lotCost ≤` the 30-minute TWAP value of a lot **at settlement**. If the price fell below the frozen price, or the pool cannot be read, the Shield buys nothing (`s = 0`); settlement itself never reverts because of the pool. Bidders then fill `F = min(100 − s, total bid lots)`. Lots left over go back to the seller. |
+| `claimBid(bidId)` / `claimBidTo(bidId, to)` | bidder | Pays out the bid's filled lots in IMD and refunds the USDC for unfilled lots. |
+| `claimSeller(offerId)` / `claimSellerTo(offerId, to)` | seller | Pays out `gross − 3 % fee` in USDC and returns any unabsorbed IMD. |
+| `shieldDeposit`, `shieldWithdraw` / `shieldWithdrawTo`, `shieldClaimGains` / `shieldClaimGainsTo` | Shield depositors | Depositors put USDC into a pool. The pool buys its slice of each offer at the discounted price, and depositors earn 80 % of the fee on the lots the Shield absorbs. Withdrawals open 30 days after your latest deposit, and cannot take funds reserved for unsettled offers (`ShieldFundsReserved`). Gains can be claimed at any time. |
 | `withdrawTreasury()` | anyone | Sends the treasury's share of fees to `treasury`. |
 
 ### Pricing (BACKSTOP economic-spec §4)
@@ -34,7 +35,19 @@ m         = TWAP_now / TWAP_past − 1
 discount  = clamp(5 % + 0.25·max(m,0) − 0.15·max(−m,0), 2 %, 12 %)
 ```
 
-The Shield takes no slice of an offer created when `m > +20 %` (pump filter).
+The Shield takes no slice of an offer created when `m > +20 %` (pump filter). If the older window values
+a lot at zero quote units, `m` is reported as the largest value (`type(int128).max`), so that rise trips
+the filter too.
+
+The pump filter compares two windows of the same pool, so it cannot see a price that was held for both of
+them. Two further guards cover that:
+
+- **Settlement-time bound.** Bidders see `lotCost` and choose. Shield depositors cannot choose, so the
+  Shield buys only if `lotCost` is still at or below the pool TWAP when `settle` runs. A seller who
+  inflates the TWAP before `createOffer` must keep it inflated until settlement is mined, and anyone may
+  settle the moment the deadline passes.
+- **Seller's bound.** `minLotCost` and `validUntil` let a seller refuse an offer priced below what they
+  saw, whatever moved the TWAP in between.
 
 ### Allocation when oversubscribed
 
@@ -48,10 +61,13 @@ Allocation is computed lazily at claim time, so settlement is O(1) however many 
 ### Fees
 
 `TRADE_FEE_BPS = 300` (3 %), rounded up. The seller pays it on the absorbed lots (Shield slice plus
-bidder fills). Absorbers pay no fee. `SHIELD_FEE_SHARE_BPS = 8_000` of the fee goes to Shield
-depositors. That is BACKSTOP's 70 % holder-chest share plus its 10 % Shield share, explained below.
-The remaining 20 % goes to `treasury`, which starts as the owner. If the Shield is empty, the whole fee
-goes to the treasury.
+bidder fills). Absorbers pay no fee. Shield depositors receive `SHIELD_FEE_SHARE_BPS = 8_000` of the
+fee **on the lots the Shield absorbed**: `shieldFee = fee × 80 % × s / (s + F)`. That share is
+BACKSTOP's 70 % holder-chest share plus its 10 % Shield share, explained below. Everything else goes
+to `treasury`, which starts as the owner: 20 % of the fee on Shield lots and the whole fee on lots
+bought by bidders. When the Shield absorbs nothing (empty, dust, pump filter, price bound), the whole
+fee goes to the treasury. A deposit that cannot absorb a lot therefore earns no fee, and no fee is ever
+credited to a Shield with no live deposits.
 
 ### Shield accounting
 
@@ -60,8 +76,20 @@ The Shield uses Liquity stability-pool accounting:
 - `S` accumulates IMD gains and `G` accumulates fee gains.
 - `P` is rescaled by 1e9 whenever it drops below 1e9.
 
-All rounding goes down, so the amounts owed never exceed what the contract holds (tested). The Shield
-spends at most 50 % of its deposits on one offer, so the pool can never be fully drained.
+All rounding goes down, so the amounts owed never exceed what the contract holds (tested).
+
+The Shield's commitments are counted across offers, not per offer. `shieldReservedQuote` is the quote
+reserved for all unsettled offers. A new offer can reserve only what is left of 50 % of the deposits,
+and a withdrawal reverts if it would leave less than twice the reserved amount. So at most half of the
+Shield is committed at any time, however an escrow is split into offers, and one absorption never takes
+more than half of the deposits. Settling an offer releases its reservation whether or not the Shield
+bought.
+
+What the Shield does **not** do is fix the set of depositors at creation. The lots are bought at
+settlement and shared among the deposits present then. Someone who deposits during an offer's window
+shares the reserved lots (and the 30-day lock) with earlier depositors; they cannot enlarge the slice or
+take lots from bidders. Someone who withdraws unreserved funds before settlement leaves the reserved
+lots to the depositors who stay. This is the same behaviour as a Liquity stability pool.
 
 ## Parameters
 
@@ -78,8 +106,9 @@ Constants are BACKSTOP's `economic-spec.md` defaults. Where I changed one for Et
 | `MOMENTUM_LOOKBACK` | 1 hour | spec |
 | `SHIELD_MAX_PREMIUM_BPS` | 2 000 | spec pump filter |
 | `SHIELD_MAX_SHARE_BPS` | 5 000 | spec |
-| `SHIELD_MAX_FUNDS_USE_BPS` | 5 000 | my choice: caps Shield spending per offer at half its deposits |
+| `SHIELD_MAX_FUNDS_USE_BPS` | 5 000 | my choice: caps what the Shield commits to all unsettled offers together at half its deposits |
 | `SHIELD_MIN_LOCK` | 30 days | spec. Restarts on every deposit. |
+| `PRICE_SOURCE_DELAY` | 37 days (`SHIELD_MIN_LOCK + 7 days`) | my choice: a replacement price source waits this long, so every deposit locked when the change is announced has 7 days to leave before it applies |
 
 ### Constructor arguments for the launch
 
@@ -101,33 +130,60 @@ assignment broadcasts nothing.
 
 | Setting | Setter (owner only, emits an event) | What to set it to | Where to get it |
 |---|---|---|---|
-| Price source | `setPriceSource(pool)` → `PriceSourceSet` | A Uniswap v3 IMD/USDC pool | Read at build time from the Uniswap v3 factory `0x1F98431c8aD98523631AE4a59f267346ea31F984`: the 0.3 % pool `0x894d4e6d3d2abc64fc0de0e4e2ea63a93bc9c520` holds the liquidity, and the 1 % pool `0x3a6a81b9950bcdfc01eff5ff599c31e919576a5f` was empty. **First** call `increaseObservationCardinalityNext(≥ 600)` on the pool (its cardinality was 1 at build time). Then wait at least 90 minutes (`TWAP_WINDOW + MOMENTUM_LOOKBACK`) for history to build up. Until then `observe` reverts and so does `createOffer`. |
-| Treasury | `setTreasury(addr)` → `TreasurySet` | Where the 20 % fee share goes | Owner's choice. Defaults to the owner. |
-| Pause | `setPaused(bool)` → `PausedSet` | Emergency stop for new offers, bids and Shield deposits | Owner's choice |
+| Price source (first time, immediate) | `setPriceSource(pool)` → `PriceSourceSet` | A Uniswap v3 IMD/USDC pool **with real two-sided liquidity** (see the oracle warning below) | Read at build time from the Uniswap v3 factory `0x1F98431c8aD98523631AE4a59f267346ea31F984`: the 0.3 % pool `0x894d4e6d3d2abc64fc0de0e4e2ea63a93bc9c520` holds the liquidity, and the 1 % pool `0x3a6a81b9950bcdfc01eff5ff599c31e919576a5f` was empty. **First** call `increaseObservationCardinalityNext(≥ 600)` on the pool (its cardinality was 1 at build time). Then wait at least 90 minutes (`TWAP_WINDOW + MOMENTUM_LOOKBACK`) for history to build up. Until then `observe` reverts and so does `createOffer`. |
+| Price source (replacement, delayed) | `setPriceSource(pool)` → `PriceSourceChangeScheduled`, then `applyPriceSource()` → `PriceSourceSet` after `PRICE_SOURCE_DELAY` (37 days). `cancelPriceSourceChange()` → `PriceSourceChangeCancelled` drops it. | Another Uniswap v3 IMD/USDC pool, for example after liquidity migrates | Same factory. The old source keeps pricing offers until `applyPriceSource` succeeds. Pause new offers meanwhile if the old pool is no longer usable. |
+| Treasury | `setTreasury(addr)` → `TreasurySet` | Where the treasury's fee share goes | Owner's choice. Defaults to the owner. |
+| Pause | `setPaused(bool)` → `PausedSet` | Emergency stop for new offers and Shield deposits | Owner's choice |
 
-Until `priceSource` is set, `createOffer` and `quoteLot` revert with `PriceSourceNotConfigured`. Bids,
-settlement and the Shield do not need it.
+Until `priceSource` is set, `createOffer`, `quoteLot`, `twapLotValue` and `shieldDeposit` revert with
+`PriceSourceNotConfigured`. A Shield deposit is therefore never made before the pool that will price it
+is public.
+
+**Oracle warning for the launch pool.** Read on chain 1 during this revision, the
+0.3 % pool `0x894d…c520` held about 0.21 USDC against about 6,550 IMD, with observation cardinality 1.
+A pool like that can be moved for almost nothing and holds no price history. The contract cannot verify
+depth for the owner. Before setting it as the price source, the owner must make sure the pool has deep
+liquidity on both sides and enough cardinality, and should keep Shield deposits small relative to the
+cost of moving that pool. The guards in this contract (settlement-time bound, 50 % commitment cap,
+`shieldPerOfferCap`, pump filter) limit the damage of a manipulated TWAP; they do not make a shallow
+pool a sound oracle.
 
 ## Administrative powers and trust assumptions
 
 - **Owner** (two-step transfer: `transferOwnership` then `acceptOwnership`) can:
-  - set or change the price source. A malicious pool could misprice *new* offers. Existing offers keep their frozen price.
+  - choose the first price source, and schedule a replacement that applies 37 days later. The contract
+    checks only that the pool's `token0`/`token1` are IMD and USDC. It does not check that the pool
+    comes from the Uniswap factory or that it is liquid, so **the price source is trusted**: a source
+    that reports a false price misprices offers, and the Shield, which must buy, pays that price
+    (bounded by the 50 % commitment cap and `shieldPerOfferCap` per offer, and by nothing else). That
+    is how an owner could move Shield deposits to itself as a seller. The delay is what protects
+    depositors: the source in force is public before anyone can deposit, a replacement is announced
+    37 days ahead by an event, and a deposit locked at the announcement can be withdrawn at least
+    7 days before the replacement applies. A deposit made after the announcement accepts the pending
+    source.
   - set the treasury.
-  - pause entry.
+  - pause new offers and Shield deposits. A pause does not stop bids on open offers, settlement, claims
+    or withdrawals, so it cannot be used to shut bidders out of an open offer or to hold funds.
 
-  The owner **cannot** pause or block settlement, claims, Shield withdrawals or treasury withdrawal. It
-  cannot move escrowed funds, change fees or parameters, or upgrade the contract. There is no sweep, no
-  proxy, no `delegatecall` and no `selfdestruct`.
+  The owner **cannot** block settlement, claims, Shield withdrawals or treasury withdrawal, change fees
+  or parameters, or upgrade the contract. Apart from the price-source power described above, it has no
+  way to move escrowed funds. There is no sweep, no proxy, no `delegatecall` and no `selfdestruct`.
 - **TWAP oracle**: a 30-minute v3 TWAP can be moved by someone willing to hold a skewed price across
-  many blocks. A shallow pool makes that cheaper. The discount is capped at 12 %, and the pump filter
-  stops the Shield buying after a +20 % move, but a seller who pushes the TWAP up still sells high to
-  bidders. Bidders choose whether to bid after seeing `lotCost`.
+  many blocks. A shallow pool makes that cheaper. The discount is capped at 12 %, the pump filter
+  stops the Shield buying after a +20 % move, and the Shield re-checks the TWAP at settlement. A seller
+  who holds the TWAP up from 90 minutes before `createOffer` until settlement still sells high to the
+  Shield's reserved slice and to bidders. Bidders choose whether to bid after seeing `lotCost`; Shield
+  depositors rely on the pool being expensive to move.
+- **Settlement timing**: `settle` is permissionless and the Shield's purchase depends on the TWAP in
+  the block it is mined in. Whoever settles first decides that block, so depositors and sellers both
+  have a reason to run a keeper at the deadline.
 - **"Existing holder"** means the bidder's IMD balance at the moment of bidding. A flash loan or a
   second wallet gets past this check. BACKSTOP measures tenure with a Token-2022 transfer hook, which
   IMD, an existing OFT, cannot get. The seller can also bid from a second address.
 - **Tokens**: transfers must deliver the exact amount, so fee-on-transfer tokens are rejected. If USDC
   blacklists a recipient, only that recipient's claim fails. Everyone else's claims and settlement go
-  through, because all payouts are pulled by the recipient.
+  through, because all payouts are pulled by the recipient. The blocked party can still collect both
+  legs at another address with `claimSellerTo`, `claimBidTo`, `shieldClaimGainsTo` or `shieldWithdrawTo`.
 - **Reentrancy**: every state-changing function is `nonReentrant`, and state is updated before any
   transfer (tested with a reentrant token).
 
@@ -151,8 +207,12 @@ could not find $SHIFT's chain or contract address, so this launch deploys the IM
 
 ## Operational responsibilities
 
-- **Owner**: set and maintain the price source (pool cardinality), keep the owner key safe, and use the
-  pause only in emergencies.
+- **Owner**: set and maintain the price source (pool depth and cardinality), announce a replacement
+  37 days ahead, keep the owner key safe, and use the pause only in emergencies.
+- **Sellers**: use `createOffer(amount, minLotCost, validUntil)` with `minLotCost` taken from
+  `quoteLot(amount / 100)`.
+- **Shield depositors**: watch for `PriceSourceChangeScheduled`, and leave before `priceSourceActivatesAt`
+  if you do not accept the new pool.
 - **Anyone or a keeper**: call `settle(offerId)` after each deadline. It is permissionless and cheap.
   Users then claim their own funds. Nothing ever expires, so unclaimed funds stay claimable forever.
 - **Before release**: these tests are not an audit. An independent adversarial review is required,
@@ -162,7 +222,7 @@ could not find $SHIFT's chain or contract address, so this launch deploys the IM
 
 ```
 forge build
-forge test        # 40 tests: unit, failure paths, reentrancy, blocked recipient, Shield rescale, fuzzed conservation
+forge test        # 58 tests: unit, failure paths, reentrancy, blocked recipient, Shield rescale, price bounds, delayed price source, fuzzed conservation
 forge fmt --check
 ```
 

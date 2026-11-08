@@ -72,6 +72,12 @@ contract NightshiftBackstopTest is Test {
         pool.setTicks(0, address(imd) < address(usdc) ? ticks : -ticks);
     }
 
+    /// @dev Sets the IMD price of the older and the current TWAP window, in ticks (positive = IMD up).
+    function _setTicks(int24 past, int24 now_) internal {
+        bool imdFirst = address(imd) < address(usdc);
+        pool.setTicks(imdFirst ? past : -past, imdFirst ? now_ : -now_);
+    }
+
     function _settle(uint256 id) internal {
         vm.warp(block.timestamp + bs.OFFER_WINDOW());
         bs.settle(id);
@@ -126,12 +132,111 @@ contract NightshiftBackstopTest is Test {
         vm.expectRevert(NightshiftBackstop.ZeroAddress.selector);
         bs.setPriceSource(address(0));
 
+        // The first configuration is immediate.
+        NightshiftBackstop fresh = new NightshiftBackstop(owner, address(imd), address(usdc), MIN_OFFER, CAP, HOLDING);
         MockPool other = new MockPool(address(usdc), address(imd));
+        vm.expectEmit(true, false, false, false, address(fresh));
+        emit NightshiftBackstop.PriceSourceSet(address(other));
+        vm.prank(owner);
+        fresh.setPriceSource(address(other));
+        assertEq(fresh.priceSource(), address(other));
+        assertEq(fresh.pendingPriceSource(), address(0));
+    }
+
+    function test_priceSourceChangeIsDelayed() public {
+        MockPool other = new MockPool(address(usdc), address(imd));
+        bool imdFirst = address(imd) < address(usdc);
+        other.setTicks(imdFirst ? int24(46_000) : int24(-46_000), imdFirst ? int24(46_000) : int24(-46_000)); // ~100x
+        uint256 activatesAt = block.timestamp + bs.PRICE_SOURCE_DELAY();
+        assertGt(bs.PRICE_SOURCE_DELAY(), bs.SHIELD_MIN_LOCK());
+
+        vm.expectEmit(true, false, false, true, address(bs));
+        emit NightshiftBackstop.PriceSourceChangeScheduled(address(other), activatesAt);
+        vm.prank(owner);
+        bs.setPriceSource(address(other));
+        assertEq(bs.priceSource(), address(pool), "old source still prices offers");
+        assertEq(bs.pendingPriceSource(), address(other));
+        assertEq(bs.priceSourceActivatesAt(), activatesAt);
+        (uint256 cost,,) = bs.quoteLot(10e18);
+        assertEq(cost, LOT_COST);
+        uint256 id = _offer();
+        assertEq(bs.getOffer(id).lotCost, LOT_COST);
+
+        vm.prank(outsider);
+        vm.expectRevert(NightshiftBackstop.NotOwner.selector);
+        bs.applyPriceSource();
+        vm.warp(activatesAt - 1);
+        vm.prank(owner);
+        vm.expectRevert(NightshiftBackstop.PriceSourceDelayNotElapsed.selector);
+        bs.applyPriceSource();
+
+        vm.warp(activatesAt);
         vm.expectEmit(true, false, false, false, address(bs));
         emit NightshiftBackstop.PriceSourceSet(address(other));
         vm.prank(owner);
-        bs.setPriceSource(address(other));
+        bs.applyPriceSource();
         assertEq(bs.priceSource(), address(other));
+        assertEq(bs.pendingPriceSource(), address(0));
+        assertEq(bs.priceSourceActivatesAt(), 0);
+        vm.prank(owner);
+        vm.expectRevert(NightshiftBackstop.NoPendingPriceSource.selector);
+        bs.applyPriceSource();
+    }
+
+    function test_priceSourceChangeCanBeCancelledAndRescheduled() public {
+        MockPool other = new MockPool(address(usdc), address(imd));
+        vm.prank(owner);
+        vm.expectRevert(NightshiftBackstop.NoPendingPriceSource.selector);
+        bs.cancelPriceSourceChange();
+        vm.prank(owner);
+        bs.setPriceSource(address(other));
+        vm.prank(outsider);
+        vm.expectRevert(NightshiftBackstop.NotOwner.selector);
+        bs.cancelPriceSourceChange();
+        vm.expectEmit(true, false, false, false, address(bs));
+        emit NightshiftBackstop.PriceSourceChangeCancelled(address(other));
+        vm.prank(owner);
+        bs.cancelPriceSourceChange();
+        assertEq(bs.pendingPriceSource(), address(0));
+
+        // Scheduling again restarts the whole delay.
+        vm.warp(block.timestamp + 10 days);
+        vm.prank(owner);
+        bs.setPriceSource(address(other));
+        vm.warp(block.timestamp + 20 days);
+        vm.prank(owner);
+        bs.setPriceSource(address(other));
+        assertEq(bs.priceSourceActivatesAt(), block.timestamp + bs.PRICE_SOURCE_DELAY());
+    }
+
+    function test_lockedDepositorCanLeaveBeforeNewPriceSource() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(1_000e18); // locked for 30 days from now
+        MockPool other = new MockPool(address(usdc), address(imd));
+        vm.prank(owner);
+        bs.setPriceSource(address(other)); // announced in the same block as the deposit
+        vm.warp(block.timestamp + bs.SHIELD_MIN_LOCK());
+        assertLt(block.timestamp, bs.priceSourceActivatesAt());
+        vm.prank(owner);
+        vm.expectRevert(NightshiftBackstop.PriceSourceDelayNotElapsed.selector);
+        bs.applyPriceSource();
+        vm.prank(shielder);
+        bs.shieldWithdraw(1_000e18);
+        assertEq(bs.shieldTotalDeposits(), 0);
+    }
+
+    function test_shieldDepositNeedsPriceSource() public {
+        NightshiftBackstop b = new NightshiftBackstop(owner, address(imd), address(usdc), MIN_OFFER, CAP, HOLDING);
+        vm.startPrank(shielder);
+        usdc.approve(address(b), type(uint256).max);
+        vm.expectRevert(NightshiftBackstop.PriceSourceNotConfigured.selector);
+        b.shieldDeposit(1e18);
+        vm.stopPrank();
+        vm.prank(owner);
+        b.setPriceSource(address(pool));
+        vm.prank(shielder);
+        b.shieldDeposit(1e18);
+        assertEq(b.shieldTotalDeposits(), 1e18);
     }
 
     function test_twoStepOwnership() public {
@@ -175,12 +280,15 @@ contract NightshiftBackstopTest is Test {
         vm.prank(seller);
         vm.expectRevert(NightshiftBackstop.Paused.selector);
         bs.createOffer(OFFER);
-        vm.prank(bob);
+        vm.prank(seller);
         vm.expectRevert(NightshiftBackstop.Paused.selector);
-        bs.placeBid(id, 1);
+        bs.createOffer(OFFER, 0, block.timestamp);
         vm.prank(shielder);
         vm.expectRevert(NightshiftBackstop.Paused.selector);
         bs.shieldDeposit(1e18);
+        // An offer that is already open stays biddable: its clock does not stop for a pause.
+        uint256 bobBid = _bid(bob, id, 10);
+        assertEq(bs.getBid(bobBid).lots, 10);
 
         _settle(id);
         vm.prank(alice);
@@ -438,9 +546,11 @@ contract NightshiftBackstopTest is Test {
         assertEq(o.filledLots, 50);
         assertEq(bs.filledLotsOf(a), 50);
 
+        // The Shield earns 80 % of the fee on the 50 lots it absorbed; the rest is the treasury's.
         uint256 fee = (100 * LOT_COST * 300 + 9_999) / 10_000;
-        uint256 shieldFee = fee * 8_000 / 10_000;
+        uint256 shieldFee = fee * 8_000 / 10_000 * 50 / 100;
         assertEq(bs.treasuryAccrued(), fee - shieldFee);
+        assertEq(bs.shieldReservedQuote(), 0);
 
         (uint256 dep, uint256 tokenGain, uint256 quoteGain,) = bs.shieldPosition(shielder);
         assertApproxEqAbs(dep, 2_000e18 - 50 * LOT_COST, 1e6);
@@ -554,6 +664,8 @@ contract NightshiftBackstopTest is Test {
 
     function test_shieldScaleChangeKeepsAccounting() public {
         ShieldHarness h = new ShieldHarness(owner, address(imd), address(usdc));
+        vm.prank(owner);
+        h.setPriceSource(address(pool));
         vm.startPrank(shielder);
         usdc.approve(address(h), type(uint256).max);
         h.shieldDeposit(1_000_000e18);
@@ -587,6 +699,8 @@ contract NightshiftBackstopTest is Test {
 
     function test_shieldDepositsBeyondTwoScalesCompoundToZero() public {
         ShieldHarness h = new ShieldHarness(owner, address(imd), address(usdc));
+        vm.prank(owner);
+        h.setPriceSource(address(pool));
         usdc.mint(shielder, 1e30);
         vm.startPrank(shielder);
         usdc.approve(address(h), type(uint256).max);
@@ -753,5 +867,390 @@ contract NightshiftBackstopTest is Test {
         }
         assertLe(owedQuote, usdc.balanceOf(address(bs)) - bs.treasuryAccrued());
         assertLe(owedToken, imd.balanceOf(address(bs)));
+    }
+
+    // ------------------------------------------------------------------ revision: Shield price bound at settlement
+
+    function test_shieldDoesNotBuyAboveSettlementTwap() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(10_000e18);
+        _setTicks(23_027, 23_027); // ~10x held across both windows: momentum 0, the pump filter passes
+        uint256 id = _offer();
+        NightshiftBackstop.Offer memory o = bs.getOffer(id);
+        assertTrue(o.shieldEligible);
+        assertEq(o.discountBps, 500);
+        assertEq(o.shieldReservedLots, 50);
+        assertEq(bs.shieldReservedQuote(), 50 * o.lotCost);
+        uint256 a = _bid(alice, id, 10); // a bidder who accepts the price is still filled
+
+        _setTicks(0, 0); // the price is back at 1 by settlement
+        _settle(id);
+        o = bs.getOffer(id);
+        assertEq(o.shieldLots, 0, "Shield must not pay 10x the pool price");
+        assertEq(o.filledLots, 10);
+        assertEq(bs.filledLotsOf(a), 10);
+        assertEq(bs.shieldTotalDeposits(), 10_000e18);
+        assertEq(bs.shieldReservedQuote(), 0, "reservation released");
+        (uint256 dep, uint256 tg, uint256 qg,) = bs.shieldPosition(shielder);
+        assertEq(dep, 10_000e18);
+        assertEq(tg, 0);
+        assertEq(qg, 0);
+        assertEq(bs.treasuryAccrued(), (10 * o.lotCost * 300 + 9_999) / 10_000, "no Shield lots, no Shield fee");
+    }
+
+    function test_shieldBuysDownToTheFrozenPriceAndNotBelow() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(10_000e18);
+        uint256 id1 = _offer();
+        uint256 id2 = _offer();
+        vm.warp(block.timestamp + bs.OFFER_WINDOW());
+
+        _setTicks(0, -512); // a lot is worth ~9.5009, just above the frozen 9.5
+        assertGe(bs.twapLotValue(10e18), LOT_COST);
+        bs.settle(id1);
+        assertEq(bs.getOffer(id1).shieldLots, 50);
+
+        _setTicks(0, -513); // ~9.49996, just below
+        assertLt(bs.twapLotValue(10e18), LOT_COST);
+        bs.settle(id2);
+        assertEq(bs.getOffer(id2).shieldLots, 0);
+        assertEq(bs.shieldReservedQuote(), 0);
+        assertEq(bs.shieldTotalDeposits(), 10_000e18 - 50 * LOT_COST);
+    }
+
+    function test_unreadablePoolAtSettlementSkipsShieldOnly() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(2_000e18);
+        uint256 id = _offer();
+        uint256 a = _bid(alice, id, 100);
+        assertEq(bs.getOffer(id).shieldReservedLots, 50);
+        pool.setBroken(true);
+        _settle(id); // must not revert
+        NightshiftBackstop.Offer memory o = bs.getOffer(id);
+        assertEq(o.shieldLots, 0);
+        assertEq(o.filledLots, 100);
+        assertEq(bs.filledLotsOf(a), 100);
+        assertEq(bs.shieldTotalDeposits(), 2_000e18);
+        assertEq(bs.shieldReservedQuote(), 0);
+    }
+
+    // ------------------------------------------------------------------ revision: Shield slice fixed at creation
+
+    function test_lateShieldDepositDoesNotJoinOffer() public {
+        uint256 id = _offer(); // Shield empty at creation
+        uint256 a = _bid(alice, id, 100);
+        vm.warp(block.timestamp + bs.OFFER_WINDOW());
+        vm.prank(outsider);
+        bs.shieldDeposit(950e18); // after the deadline
+        bs.settle(id);
+        NightshiftBackstop.Offer memory o = bs.getOffer(id);
+        assertEq(o.shieldReservedLots, 0);
+        assertEq(o.shieldLots, 0);
+        assertEq(bs.filledLotsOf(a), 100);
+        (uint256 dep, uint256 tg, uint256 qg,) = bs.shieldPosition(outsider);
+        assertEq(dep, 950e18);
+        assertEq(tg, 0);
+        assertEq(qg, 0);
+        assertEq(bs.treasuryAccrued(), (100 * LOT_COST * 300 + 9_999) / 10_000);
+    }
+
+    function test_depositDuringWindowDoesNotEnlargeShieldSlice() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(100e18); // half usable = 50 -> 5 lots
+        uint256 id = _offer();
+        assertEq(bs.getOffer(id).shieldReservedLots, 5);
+        vm.prank(carol);
+        bs.shieldDeposit(10_000e18);
+        _settle(id);
+        assertEq(bs.getOffer(id).shieldLots, 5);
+    }
+
+    function test_withdrawCannotTakeFundsReservedForOpenOffers() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(1_000e18);
+        vm.warp(block.timestamp + 30 days);
+        uint256 id = _offer();
+        assertEq(bs.shieldReservedQuote(), 475e18); // 50 lots x 9.5
+
+        vm.startPrank(shielder);
+        vm.expectRevert(NightshiftBackstop.ShieldFundsReserved.selector);
+        bs.shieldWithdraw(1_000e18);
+        vm.expectRevert(NightshiftBackstop.ShieldFundsReserved.selector);
+        bs.shieldWithdraw(50e18 + 2);
+        bs.shieldWithdraw(50e18); // 950 left: half of it still covers the 475 reserved
+        vm.stopPrank();
+
+        _settle(id);
+        assertEq(bs.getOffer(id).shieldLots, 50);
+        (uint256 dep,,,) = bs.shieldPosition(shielder);
+        vm.prank(shielder);
+        bs.shieldWithdraw(dep); // free again once the offer is settled
+    }
+
+    function test_splitOffersShareOneShieldBudget() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(1_000e18);
+        uint256[5] memory ids;
+        for (uint256 i; i < 5; ++i) {
+            ids[i] = _offer(); // same block, same price
+        }
+        assertEq(bs.getOffer(ids[0]).shieldReservedLots, 50); // 475 of the 500 usable
+        assertEq(bs.getOffer(ids[1]).shieldReservedLots, 2); // 19 of the 25 left
+        assertEq(bs.getOffer(ids[2]).shieldReservedLots, 0);
+        assertLe(bs.shieldReservedQuote(), 500e18);
+        vm.warp(block.timestamp + bs.OFFER_WINDOW());
+        uint256 lots;
+        for (uint256 i; i < 5; ++i) {
+            bs.settle(ids[i]);
+            lots += bs.getOffer(ids[i]).shieldLots;
+        }
+        assertEq(lots, 52);
+        assertGe(bs.shieldTotalDeposits(), 500e18, "at most half of the Shield went to one price");
+    }
+
+    // ------------------------------------------------------------------ revision: seller's price bound
+
+    function test_createOfferWithPriceBound() public {
+        vm.startPrank(seller);
+        vm.expectRevert(NightshiftBackstop.LotCostBelowMinimum.selector);
+        bs.createOffer(OFFER, LOT_COST + 1, block.timestamp);
+        vm.expectRevert(NightshiftBackstop.OfferExpired.selector);
+        bs.createOffer(OFFER, LOT_COST, block.timestamp - 1);
+        uint256 id = bs.createOffer(OFFER, LOT_COST, block.timestamp);
+        vm.stopPrank();
+        assertEq(bs.getOffer(id).lotCost, LOT_COST);
+        assertEq(imd.balanceOf(address(bs)), OFFER);
+
+        // The TWAP falls while the next offer is pending: the bounded call refuses the lower price.
+        _move(-1000);
+        (uint256 lower,,) = bs.quoteLot(10e18);
+        assertLt(lower, LOT_COST);
+        vm.prank(seller);
+        vm.expectRevert(NightshiftBackstop.LotCostBelowMinimum.selector);
+        bs.createOffer(OFFER, LOT_COST, block.timestamp + 1 hours);
+        assertEq(bs.offerCount(), 1);
+    }
+
+    // ------------------------------------------------------------------ revision: fee share follows absorbed lots
+
+    function test_dustLeftInShieldDoesNotStrandFees() public {
+        vm.prank(shielder);
+        bs.shieldDeposit(28.5e18);
+        uint256 id1 = _offer();
+        _settle(id1);
+        assertEq(bs.getOffer(id1).shieldLots, 1);
+        vm.warp(block.timestamp + 30 days);
+        (uint256 dep,,,) = bs.shieldPosition(shielder);
+        vm.prank(shielder);
+        bs.shieldWithdraw(dep);
+        assertLe(bs.shieldTotalDeposits(), 1e3, "only rounding dust is left");
+
+        uint256 before = bs.treasuryAccrued();
+        uint256 id2 = _offer();
+        _bid(alice, id2, 50);
+        _settle(id2);
+        uint256 fee = (50 * LOT_COST * 300 + 9_999) / 10_000;
+        assertEq(bs.treasuryAccrued() - before, fee, "the whole fee goes to the treasury");
+        bs.withdrawTreasury();
+        vm.prank(seller);
+        bs.claimSeller(id1);
+        vm.prank(seller);
+        bs.claimSeller(id2);
+    }
+
+    function test_oneWeiDepositEarnsNoFees() public {
+        vm.prank(carol);
+        bs.shieldDeposit(1);
+        uint256 id = _offer();
+        _bid(alice, id, 100);
+        _settle(id);
+        assertEq(bs.getOffer(id).shieldLots, 0);
+        assertEq(bs.treasuryAccrued(), (100 * LOT_COST * 300 + 9_999) / 10_000);
+        (,, uint256 qg,) = bs.shieldPosition(carol);
+        assertEq(qg, 0);
+    }
+
+    // ------------------------------------------------------------------ revision: momentum, pause, recipients
+
+    function test_momentumSaturatesWhenPastValueRoundsToZero() public {
+        MockERC20 usdc6 = new MockERC20("USD Coin", "USDC", 6);
+        NightshiftBackstop b = new NightshiftBackstop(owner, address(imd), address(usdc6), MIN_OFFER, 10_000e6, 0);
+        MockPool p = new MockPool(address(imd), address(usdc6));
+        vm.prank(owner);
+        b.setPriceSource(address(p));
+        bool imdFirst = address(imd) < address(usdc6);
+        usdc6.mint(shielder, 10_000e6);
+        vm.startPrank(shielder);
+        usdc6.approve(address(b), type(uint256).max);
+        b.shieldDeposit(10_000e6);
+        vm.stopPrank();
+
+        // The older window values a 10 IMD lot below one USDC unit; the current one at ~33 USDC.
+        p.setTicks(imdFirst ? int24(-460_000) : int24(460_000), imdFirst ? int24(-264_331) : int24(264_331));
+        (uint256 lotCost, uint256 discount, int256 momentum) = b.quoteLot(10e18);
+        assertEq(momentum, int256(type(int128).max));
+        assertEq(discount, 1_200);
+        assertGt(lotCost, 0);
+        vm.startPrank(seller);
+        imd.approve(address(b), type(uint256).max);
+        uint256 id = b.createOffer(OFFER);
+        vm.stopPrank();
+        assertFalse(b.getOffer(id).shieldEligible, "the largest rise must trip the pump filter");
+        assertEq(b.getOffer(id).shieldReservedLots, 0);
+
+        // No price in either window is no momentum.
+        p.setTicks(imdFirst ? int24(-460_000) : int24(460_000), imdFirst ? int24(-460_000) : int24(460_000));
+        (,, momentum) = b.quoteLot(10e18);
+        assertEq(momentum, 0);
+    }
+
+    function test_pauseDoesNotShutBiddersOut() public {
+        uint256 id = _offer();
+        imd.mint(owner, 1e18);
+        usdc.mint(owner, 10_000e18);
+        vm.startPrank(owner);
+        usdc.approve(address(bs), type(uint256).max);
+        uint256 first = bs.placeBid(id, 100);
+        bs.setPaused(true);
+        vm.stopPrank();
+        uint256 second = _bid(alice, id, 100);
+        _settle(id);
+        assertEq(bs.filledLotsOf(first), 50);
+        assertEq(bs.filledLotsOf(second), 50);
+    }
+
+    function test_blockedRecipientClaimsToAnotherAddress() public {
+        BlockingToken blk = new BlockingToken();
+        NightshiftBackstop b = new NightshiftBackstop(owner, address(imd), address(blk), MIN_OFFER, CAP, 0);
+        MockPool p = new MockPool(address(imd), address(blk));
+        vm.prank(owner);
+        b.setPriceSource(address(p));
+        address[2] memory funders = [shielder, alice];
+        for (uint256 i; i < 2; ++i) {
+            blk.mint(funders[i], 10_000e18);
+            vm.prank(funders[i]);
+            blk.approve(address(b), type(uint256).max);
+        }
+        vm.prank(shielder);
+        b.shieldDeposit(10_000e18);
+        vm.startPrank(seller);
+        imd.approve(address(b), type(uint256).max);
+        uint256 id = b.createOffer(OFFER);
+        vm.stopPrank();
+        vm.prank(alice);
+        uint256 bidId = b.placeBid(id, 100); // 50 filled, 50 refunded
+        vm.warp(block.timestamp + 1 hours);
+        b.settle(id);
+        address safe = makeAddr("safe");
+
+        // Bidder: tokens and a refund are owed; the quote token refuses the bidder.
+        blk.setBlocked(alice);
+        vm.startPrank(alice);
+        vm.expectRevert(NightshiftBackstop.TokenTransferFailed.selector);
+        b.claimBid(bidId);
+        vm.expectRevert(NightshiftBackstop.ZeroAddress.selector);
+        b.claimBidTo(bidId, address(0));
+        b.claimBidTo(bidId, safe);
+        vm.stopPrank();
+        assertEq(imd.balanceOf(safe), 500e18);
+        assertEq(blk.balanceOf(safe), 50 * LOT_COST);
+        vm.prank(bob);
+        vm.expectRevert(NightshiftBackstop.NotBidder.selector);
+        b.claimBidTo(bidId, bob);
+
+        // Seller.
+        blk.setBlocked(seller);
+        vm.prank(outsider);
+        vm.expectRevert(NightshiftBackstop.NotSeller.selector);
+        b.claimSellerTo(id, outsider);
+        vm.startPrank(seller);
+        vm.expectRevert(NightshiftBackstop.TokenTransferFailed.selector);
+        b.claimSeller(id);
+        vm.expectRevert(NightshiftBackstop.ZeroAddress.selector);
+        b.claimSellerTo(id, address(0));
+        uint256 beforeSafe = blk.balanceOf(safe);
+        b.claimSellerTo(id, safe);
+        vm.stopPrank();
+        assertEq(blk.balanceOf(safe) - beforeSafe, b.getOffer(id).sellerProceeds);
+
+        // Shield depositor: IMD gains and fee gains, then the deposit itself.
+        blk.setBlocked(shielder);
+        (uint256 dep, uint256 tg, uint256 qg,) = b.shieldPosition(shielder);
+        assertGt(tg, 0);
+        assertGt(qg, 0);
+        address vault = makeAddr("vault");
+        vm.startPrank(shielder);
+        vm.expectRevert(NightshiftBackstop.TokenTransferFailed.selector);
+        b.shieldClaimGains();
+        vm.expectRevert(NightshiftBackstop.ZeroAddress.selector);
+        b.shieldClaimGainsTo(address(0));
+        b.shieldClaimGainsTo(vault);
+        assertEq(imd.balanceOf(vault), tg);
+        assertEq(blk.balanceOf(vault), qg);
+        vm.warp(block.timestamp + 30 days);
+        vm.expectRevert(NightshiftBackstop.ZeroAddress.selector);
+        b.shieldWithdrawTo(dep, address(0));
+        b.shieldWithdrawTo(dep, vault);
+        vm.stopPrank();
+        assertEq(blk.balanceOf(vault), qg + dep);
+    }
+
+    // ------------------------------------------------------------------ revision: many offers, one Shield (fuzz)
+
+    function testFuzz_multiOfferShieldConservation(uint96 depSeed, uint8 nOffers, uint256 seed) public {
+        uint256 dep = bound(uint256(depSeed), 1e18, 50_000e18);
+        uint256 n = bound(uint256(nOffers), 1, 6);
+        vm.prank(shielder);
+        bs.shieldDeposit(dep);
+        vm.prank(carol);
+        bs.shieldDeposit(dep / 3 + 1);
+
+        uint256[] memory ids = new uint256[](n);
+        uint256[] memory bidIds = new uint256[](n);
+        for (uint256 i; i < n; ++i) {
+            ids[i] = _offer();
+            uint256 lots = uint256(keccak256(abi.encode(seed, i))) % 101;
+            if (lots != 0) bidIds[i] = _bid(alice, ids[i], lots);
+            assertLe(bs.shieldReservedQuote(), bs.shieldTotalDeposits() / 2, "never more than half committed");
+        }
+        // A late deposit changes nothing for the offers above.
+        vm.prank(bob);
+        bs.shieldDeposit(dep);
+
+        vm.warp(block.timestamp + bs.OFFER_WINDOW());
+        uint256 shieldLots;
+        for (uint256 i; i < n; ++i) {
+            // Some offers settle with the price under the frozen one: the Shield skips those.
+            bool dipped = uint256(keccak256(abi.encode(seed, i, "dip"))) % 3 == 0;
+            _setTicks(0, dipped ? int24(-600) : int24(0));
+            uint256 totalBefore = bs.shieldTotalDeposits();
+            bs.settle(ids[i]);
+            NightshiftBackstop.Offer memory o = bs.getOffer(ids[i]);
+            assertEq(o.shieldLots, dipped ? 0 : o.shieldReservedLots);
+            assertLe(o.shieldLots * o.lotCost, totalBefore / 2, "an absorption never exceeds half");
+            shieldLots += o.shieldLots;
+            if (bidIds[i] != 0) {
+                vm.prank(alice);
+                bs.claimBid(bidIds[i]);
+            }
+            vm.prank(seller);
+            bs.claimSeller(ids[i]);
+        }
+        assertEq(bs.shieldReservedQuote(), 0, "every reservation released");
+        if (bs.treasuryAccrued() != 0) bs.withdrawTreasury();
+
+        vm.warp(block.timestamp + 30 days);
+        address[3] memory ds = [shielder, carol, bob];
+        uint256 tokensOut;
+        for (uint256 i; i < 3; ++i) {
+            (uint256 d, uint256 tg,,) = bs.shieldPosition(ds[i]);
+            tokensOut += tg;
+            vm.prank(ds[i]);
+            if (d != 0) bs.shieldWithdraw(d);
+            else bs.shieldClaimGains();
+        }
+        assertLe(tokensOut, shieldLots * 10e18);
+        assertLe(imd.balanceOf(address(bs)), 1e9, "token dust only");
+        assertLe(usdc.balanceOf(address(bs)), 1e9, "quote dust only");
     }
 }

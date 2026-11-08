@@ -54,9 +54,14 @@ contract NightshiftBackstop {
     uint256 public constant SHIELD_MAX_FUNDS_USE_BPS = 5_000;
     /// @notice A Shield deposit can be withdrawn this long after the depositor's last deposit.
     uint256 public constant SHIELD_MIN_LOCK = 30 days;
+    /// @notice A replacement price source takes effect this long after the owner schedules it. It is longer
+    /// than `SHIELD_MIN_LOCK`, so every deposit made before the change was announced can leave first.
+    uint256 public constant PRICE_SOURCE_DELAY = SHIELD_MIN_LOCK + 7 days;
 
     uint256 internal constant P_PRECISION = 1e18;
     uint256 internal constant SCALE_FACTOR = 1e9;
+    /// @dev Momentum reported when the older TWAP values a lot at zero quote units: the largest rise there is.
+    int256 internal constant MOMENTUM_SATURATED = type(int128).max;
 
     // ---------------------------------------------------------------- immutables (constructor arguments)
     /// @notice The token being sold (IMD).
@@ -76,6 +81,10 @@ contract NightshiftBackstop {
     address public treasury;
     /// @notice Uniswap v3 token/quote pool whose TWAP prices offers. Unset until the owner sets it.
     address public priceSource;
+    /// @notice Replacement price source scheduled by the owner; zero when no change is pending.
+    address public pendingPriceSource;
+    /// @notice Earliest time `applyPriceSource` may install `pendingPriceSource`.
+    uint64 public priceSourceActivatesAt;
     bool public paused;
 
     // ---------------------------------------------------------------- offers
@@ -89,7 +98,8 @@ contract NightshiftBackstop {
         uint256 lotSize; // token per lot
         uint256 lotCost; // quote per lot
         uint256 bidCapacity; // total lots bid (C)
-        uint256 shieldLots; // s
+        uint256 shieldReservedLots; // lots the Shield committed to at creation (its capacity for this offer)
+        uint256 shieldLots; // s, lots the Shield bought at settlement
         uint256 filledLots; // lots filled by bidders (F)
         uint256 sellerProceeds; // quote owed to the seller after fees
     }
@@ -119,6 +129,8 @@ contract NightshiftBackstop {
 
     /// @notice Sum of compounded Shield deposits (quote units), dust included.
     uint256 public shieldTotalDeposits;
+    /// @notice Quote the Shield has committed to unsettled offers. Never more than half of `shieldTotalDeposits`.
+    uint256 public shieldReservedQuote;
     uint256 public shieldP = P_PRECISION;
     uint128 public shieldScale;
     /// @dev Token gain per unit deposit, scaled by P, per scale.
@@ -137,6 +149,8 @@ contract NightshiftBackstop {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event TreasurySet(address indexed treasury);
     event PriceSourceSet(address indexed pool);
+    event PriceSourceChangeScheduled(address indexed pool, uint256 activatesAt);
+    event PriceSourceChangeCancelled(address indexed pool);
     event PausedSet(bool paused);
     event OfferCreated(
         uint256 indexed offerId,
@@ -175,6 +189,11 @@ contract NightshiftBackstop {
     error Reentrancy();
     error PriceSourceNotConfigured();
     error PriceSourceMismatch();
+    error NoPendingPriceSource();
+    error PriceSourceDelayNotElapsed();
+    error OfferExpired();
+    error LotCostBelowMinimum();
+    error ShieldFundsReserved();
     error OfferTooSmall();
     error ZeroLotCost();
     error UnknownOffer();
@@ -264,18 +283,49 @@ contract NightshiftBackstop {
         emit TreasurySet(treasury_);
     }
 
-    /// @notice Sets the Uniswap v3 pool of `token` and `quote` whose TWAP prices new offers.
-    /// @dev The pool needs enough observation cardinality for `TWAP_WINDOW + MOMENTUM_LOOKBACK`.
+    /// @notice Sets the Uniswap v3 pool of `token` and `quote` whose TWAP prices offers.
+    /// @dev The first call installs the pool at once: until then there are no offers and no Shield deposits.
+    /// Every later call only schedules the change. `applyPriceSource` installs it after `PRICE_SOURCE_DELAY`,
+    /// so offers in flight and locked Shield deposits are never repriced by a source they did not see coming.
+    /// The pool needs enough observation cardinality for `TWAP_WINDOW + MOMENTUM_LOOKBACK`.
     function setPriceSource(address pool) external onlyOwner {
         if (pool == address(0)) revert ZeroAddress();
         address t0 = IUniswapV3PoolLike(pool).token0();
         address t1 = IUniswapV3PoolLike(pool).token1();
         if (!((t0 == token && t1 == quote) || (t0 == quote && t1 == token))) revert PriceSourceMismatch();
+        if (priceSource == address(0)) {
+            priceSource = pool;
+            emit PriceSourceSet(pool);
+            return;
+        }
+        uint256 activatesAt = block.timestamp + PRICE_SOURCE_DELAY;
+        pendingPriceSource = pool;
+        priceSourceActivatesAt = uint64(activatesAt);
+        emit PriceSourceChangeScheduled(pool, activatesAt);
+    }
+
+    /// @notice Installs the scheduled price source once `PRICE_SOURCE_DELAY` has passed.
+    function applyPriceSource() external onlyOwner {
+        address pool = pendingPriceSource;
+        if (pool == address(0)) revert NoPendingPriceSource();
+        if (block.timestamp < priceSourceActivatesAt) revert PriceSourceDelayNotElapsed();
         priceSource = pool;
+        pendingPriceSource = address(0);
+        priceSourceActivatesAt = 0;
         emit PriceSourceSet(pool);
     }
 
-    /// @notice Pauses new offers, bids and Shield deposits. Settlement, claims and withdrawals never pause.
+    /// @notice Drops the scheduled price source change.
+    function cancelPriceSourceChange() external onlyOwner {
+        address pool = pendingPriceSource;
+        if (pool == address(0)) revert NoPendingPriceSource();
+        pendingPriceSource = address(0);
+        priceSourceActivatesAt = 0;
+        emit PriceSourceChangeCancelled(pool);
+    }
+
+    /// @notice Pauses new offers and Shield deposits. Bids on offers that are already open, settlement,
+    /// claims and withdrawals never pause, so a pause cannot tilt or freeze an open offer.
     function setPaused(bool paused_) external onlyOwner {
         paused = paused_;
         emit PausedSet(paused_);
@@ -295,6 +345,26 @@ contract NightshiftBackstop {
 
     /// @notice Current offer terms for an escrow of `lotSize` per lot: (lotCost, discountBps, momentumBps).
     function quoteLot(uint256 lotSize) public view returns (uint256 lotCost, uint256 discountBps, int256 momentumBps) {
+        (uint256 priceNow, uint256 pricePast) = _twapValues(lotSize);
+        if (pricePast == 0) {
+            // A rise from nothing is the largest rise there is, not none: it must trip the pump filter.
+            momentumBps = priceNow == 0 ? int256(0) : MOMENTUM_SATURATED;
+        } else {
+            momentumBps = (int256(priceNow) - int256(pricePast)) * int256(BPS) / int256(pricePast);
+        }
+        discountBps = _discount(momentumBps);
+        // Round the lot cost up so every fill meets the frozen price.
+        lotCost = UniV3Math.mulDiv(priceNow, BPS - discountBps, BPS);
+        if (lotCost * BPS < priceNow * (BPS - discountBps)) lotCost += 1;
+    }
+
+    /// @notice Undiscounted quote value of `lotSize` tokens at the current `TWAP_WINDOW` mean price.
+    function twapLotValue(uint256 lotSize) external view returns (uint256 value) {
+        (value,) = _twapValues(lotSize);
+    }
+
+    /// @dev Quote value of `lotSize` tokens at the TWAP now and at the TWAP `MOMENTUM_LOOKBACK` ago.
+    function _twapValues(uint256 lotSize) internal view returns (uint256 priceNow, uint256 pricePast) {
         address pool = priceSource;
         if (pool == address(0)) revert PriceSourceNotConfigured();
         if (lotSize == 0 || lotSize > type(uint128).max) revert OfferTooSmall();
@@ -307,14 +377,8 @@ contract NightshiftBackstop {
         int24 tickPast = UniV3Math.meanTick(cum[0], cum[1], TWAP_WINDOW);
         int24 tickNow = UniV3Math.meanTick(cum[2], cum[3], TWAP_WINDOW);
         uint128 base = uint128(lotSize);
-        uint256 priceNow = UniV3Math.getQuoteAtTick(tickNow, base, token, quote);
-        uint256 pricePast = UniV3Math.getQuoteAtTick(tickPast, base, token, quote);
-        momentumBps =
-            pricePast == 0 ? int256(0) : (int256(priceNow) - int256(pricePast)) * int256(BPS) / int256(pricePast);
-        discountBps = _discount(momentumBps);
-        // Round the lot cost up so every fill meets the frozen price.
-        lotCost = UniV3Math.mulDiv(priceNow, BPS - discountBps, BPS);
-        if (lotCost * BPS < priceNow * (BPS - discountBps)) lotCost += 1;
+        priceNow = UniV3Math.getQuoteAtTick(tickNow, base, token, quote);
+        pricePast = UniV3Math.getQuoteAtTick(tickPast, base, token, quote);
     }
 
     function _discount(int256 momentumBps) internal pure returns (uint256) {
@@ -329,28 +393,57 @@ contract NightshiftBackstop {
     // ================================================================ offers
 
     /// @notice Escrows `amount` (rounded down to whole lots) as an offer to holders. Cannot be cancelled.
+    /// @dev Accepts whatever price the source reports in the mined block. A seller who sends this through a
+    /// public mempool should use the overload below, which bounds the price and the inclusion time.
     function createOffer(uint256 amount) external nonReentrant whenNotPaused returns (uint256 offerId) {
+        return _createOffer(amount, 0);
+    }
+
+    /// @notice As `createOffer(amount)`, but reverts unless the frozen price per lot (`amount / 100` tokens)
+    /// is at least `minLotCost` quote and the transaction is mined no later than `validUntil`.
+    function createOffer(uint256 amount, uint256 minLotCost, uint256 validUntil)
+        external
+        nonReentrant
+        whenNotPaused
+        returns (uint256 offerId)
+    {
+        if (block.timestamp > validUntil) revert OfferExpired();
+        return _createOffer(amount, minLotCost);
+    }
+
+    function _createOffer(uint256 amount, uint256 minLotCost) internal returns (uint256 offerId) {
         uint256 lotSize = amount / LOTS_PER_OFFER;
         uint256 escrow = lotSize * LOTS_PER_OFFER;
         if (escrow < minOfferSize || lotSize > type(uint128).max) revert OfferTooSmall();
         (uint256 lotCost, uint256 discountBps, int256 momentumBps) = quoteLot(lotSize);
         if (lotCost == 0) revert ZeroLotCost();
+        if (lotCost < minLotCost) revert LotCostBelowMinimum();
 
         offerId = ++offerCount;
         Offer storage o = _offers[offerId];
         o.seller = msg.sender;
         o.deadline = uint64(block.timestamp + OFFER_WINDOW);
         o.discountBps = uint16(discountBps);
-        o.shieldEligible = momentumBps <= int256(SHIELD_MAX_PREMIUM_BPS);
         o.lotSize = lotSize;
         o.lotCost = lotCost;
+        if (momentumBps <= int256(SHIELD_MAX_PREMIUM_BPS)) {
+            o.shieldEligible = true;
+            // The Shield's slice is fixed here, from the deposits present now and not already committed to
+            // other unsettled offers. A later deposit cannot enlarge it or displace bidders.
+            uint256 reservedLots = _shieldLots(lotCost);
+            if (reservedLots != 0) {
+                o.shieldReservedLots = reservedLots;
+                shieldReservedQuote += reservedLots * lotCost;
+            }
+        }
 
         _pullExact(token, escrow);
         emit OfferCreated(offerId, msg.sender, escrow, lotSize, lotCost, discountBps, momentumBps, o.deadline);
     }
 
     /// @notice Locks `lots * lotCost` quote as a bid for up to `lots` lots of offer `offerId`.
-    function placeBid(uint256 offerId, uint256 lots) external nonReentrant whenNotPaused returns (uint256 bidId) {
+    /// @dev Not pausable: a pause must not shut holders out of an offer whose clock keeps running.
+    function placeBid(uint256 offerId, uint256 lots) external nonReentrant returns (uint256 bidId) {
         Offer storage o = _offers[offerId];
         if (o.seller == address(0)) revert UnknownOffer();
         if (block.timestamp >= o.deadline) revert BiddingClosed();
@@ -368,7 +461,8 @@ contract NightshiftBackstop {
         emit BidPlaced(bidId, offerId, msg.sender, lots, paid);
     }
 
-    /// @notice Settles an offer after its window. Permissionless; needs no oracle.
+    /// @notice Settles an offer after its window. Permissionless and cannot be blocked by the price source:
+    /// if the pool cannot be read, the Shield buys nothing and the bidders are settled as usual.
     function settle(uint256 offerId) external nonReentrant {
         Offer storage o = _offers[offerId];
         if (o.seller == address(0)) revert UnknownOffer();
@@ -377,7 +471,17 @@ contract NightshiftBackstop {
         o.settled = true;
 
         uint256 lotCost = o.lotCost;
-        uint256 s = o.shieldEligible ? _shieldLots(lotCost) : 0;
+        uint256 s = o.shieldReservedLots;
+        if (s != 0) {
+            shieldReservedQuote -= s * lotCost;
+            // Bidders chose this price; Shield depositors could not. The Shield therefore buys its reserved
+            // lots only if the frozen price is still at or below the pool TWAP when it pays.
+            try this.twapLotValue(o.lotSize) returns (uint256 value) {
+                if (lotCost > value) s = 0;
+            } catch {
+                s = 0;
+            }
+        }
         uint256 remaining = LOTS_PER_OFFER - s;
         uint256 filled = o.bidCapacity < remaining ? o.bidCapacity : remaining;
         o.shieldLots = s;
@@ -387,31 +491,44 @@ contract NightshiftBackstop {
         uint256 fee = (gross * TRADE_FEE_BPS + BPS - 1) / BPS;
         o.sellerProceeds = gross - fee;
 
+        // The Shield earns its fee share only on the lots it absorbed, so a deposit that absorbs nothing
+        // (dust, 1 wei) earns nothing and its share goes to the treasury.
+        uint256 shieldFee;
         if (s != 0) {
             _shieldAbsorb(s * lotCost, s * o.lotSize);
             emit ShieldAbsorbed(offerId, s * lotCost, s * o.lotSize);
-        }
-        uint256 shieldFee = fee * SHIELD_FEE_SHARE_BPS / BPS;
-        if (shieldFee != 0 && shieldTotalDeposits != 0) {
+            shieldFee = fee * SHIELD_FEE_SHARE_BPS / BPS * s / (s + filled);
+            // After an absorption at least half of the deposits remain, so the divisor is a live base.
             shieldG[shieldScale] += UniV3Math.mulDiv(shieldFee, shieldP, shieldTotalDeposits);
-        } else {
-            shieldFee = 0;
         }
         treasuryAccrued += fee - shieldFee;
 
         emit OfferSettled(offerId, s, filled, remaining - filled, o.sellerProceeds, fee);
     }
 
+    /// @dev Lots the Shield can commit to a new offer: half of its deposits, less what unsettled offers hold.
     function _shieldLots(uint256 lotCost) internal view returns (uint256 s) {
         s = LOTS_PER_OFFER * SHIELD_MAX_SHARE_BPS / BPS;
         uint256 byCap = shieldPerOfferCap / lotCost;
         if (byCap < s) s = byCap;
-        uint256 byFunds = shieldTotalDeposits * SHIELD_MAX_FUNDS_USE_BPS / BPS / lotCost;
+        uint256 usable = shieldTotalDeposits * SHIELD_MAX_FUNDS_USE_BPS / BPS;
+        uint256 reserved = shieldReservedQuote;
+        uint256 byFunds = usable > reserved ? (usable - reserved) / lotCost : 0;
         if (byFunds < s) s = byFunds;
     }
 
     /// @notice Pays the seller their net proceeds and returns the unabsorbed lots.
     function claimSeller(uint256 offerId) external nonReentrant {
+        _claimSeller(offerId, msg.sender);
+    }
+
+    /// @notice As `claimSeller`, paid to `to`: the way out for a seller the quote token will not pay.
+    function claimSellerTo(uint256 offerId, address to) external nonReentrant {
+        _claimSeller(offerId, to);
+    }
+
+    function _claimSeller(uint256 offerId, address to) internal {
+        if (to == address(0)) revert ZeroAddress();
         Offer storage o = _offers[offerId];
         if (!o.settled) revert NotSettled();
         if (msg.sender != o.seller) revert NotSeller();
@@ -420,8 +537,8 @@ contract NightshiftBackstop {
         uint256 returnedLots = LOTS_PER_OFFER - o.shieldLots - o.filledLots;
         uint256 tokens = returnedLots * o.lotSize;
         uint256 proceeds = o.sellerProceeds;
-        if (proceeds != 0) _send(quote, msg.sender, proceeds);
-        if (tokens != 0) _send(token, msg.sender, tokens);
+        if (proceeds != 0) _send(quote, to, proceeds);
+        if (tokens != 0) _send(token, to, tokens);
         emit SellerClaimed(offerId, msg.sender, proceeds, tokens);
     }
 
@@ -439,6 +556,16 @@ contract NightshiftBackstop {
 
     /// @notice Delivers the filled lots of bid `bidId` and refunds the rest of its quote.
     function claimBid(uint256 bidId) external nonReentrant {
+        _claimBid(bidId, msg.sender);
+    }
+
+    /// @notice As `claimBid`, paid to `to`: the way out for a bidder the quote token will not pay.
+    function claimBidTo(uint256 bidId, address to) external nonReentrant {
+        _claimBid(bidId, to);
+    }
+
+    function _claimBid(uint256 bidId, address to) internal {
+        if (to == address(0)) revert ZeroAddress();
         Bid storage b = _bids[bidId];
         if (b.bidder == address(0)) revert UnknownBid();
         Offer storage o = _offers[b.offerId];
@@ -449,17 +576,19 @@ contract NightshiftBackstop {
         uint256 n = filledLotsOf(bidId);
         uint256 tokens = n * o.lotSize;
         uint256 refund = (uint256(b.lots) - n) * o.lotCost;
-        if (tokens != 0) _send(token, msg.sender, tokens);
-        if (refund != 0) _send(quote, msg.sender, refund);
+        if (tokens != 0) _send(token, to, tokens);
+        if (refund != 0) _send(quote, to, refund);
         emit BidClaimed(bidId, msg.sender, n, tokens, refund);
     }
 
     // ================================================================ Shield
 
     /// @notice Deposits quote into the Shield. Pays out pending gains and restarts the withdrawal lock.
+    /// @dev Needs the price source: a deposit is never made before the source that will price it is public.
     function shieldDeposit(uint256 amount) external nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroValue();
-        uint256 current = _payGainsAndCompound(msg.sender);
+        if (priceSource == address(0)) revert PriceSourceNotConfigured();
+        uint256 current = _payGainsAndCompound(msg.sender, msg.sender);
         uint256 updated = current + amount;
         shieldTotalDeposits += amount;
         _snapshot(msg.sender, updated);
@@ -469,22 +598,44 @@ contract NightshiftBackstop {
     }
 
     /// @notice Withdraws `amount` of the caller's compounded Shield deposit after the lock; pays gains.
+    /// @dev Reverts with `ShieldFundsReserved` if it would leave less than twice what the Shield has
+    /// committed to unsettled offers; settle them (anyone can) or withdraw less.
     function shieldWithdraw(uint256 amount) external nonReentrant {
+        _shieldWithdraw(amount, msg.sender);
+    }
+
+    /// @notice As `shieldWithdraw`, with the deposit and the gains paid to `to`.
+    function shieldWithdrawTo(uint256 amount, address to) external nonReentrant {
+        _shieldWithdraw(amount, to);
+    }
+
+    function _shieldWithdraw(uint256 amount, address to) internal {
+        if (to == address(0)) revert ZeroAddress();
         ShieldDeposit storage d = _shield[msg.sender];
         if (d.initial == 0) revert InsufficientShieldDeposit();
         if (block.timestamp < uint256(d.lastDepositAt) + SHIELD_MIN_LOCK) revert ShieldLocked();
-        uint256 current = _payGainsAndCompound(msg.sender);
+        uint256 current = _payGainsAndCompound(msg.sender, to);
         if (amount == 0 || amount > current) revert InsufficientShieldDeposit();
         uint256 updated = current - amount;
-        shieldTotalDeposits = amount > shieldTotalDeposits ? 0 : shieldTotalDeposits - amount;
+        uint256 total = amount > shieldTotalDeposits ? 0 : shieldTotalDeposits - amount;
+        // Funds committed to open offers stay, and every absorption stays at or below half of the deposits.
+        if (total * SHIELD_MAX_FUNDS_USE_BPS / BPS < shieldReservedQuote) revert ShieldFundsReserved();
+        shieldTotalDeposits = total;
         _snapshot(msg.sender, updated);
-        _send(quote, msg.sender, amount);
+        _send(quote, to, amount);
         emit ShieldWithdrawn(msg.sender, amount, updated);
     }
 
     /// @notice Pays the caller's absorbed tokens and fee rewards without touching the deposit or its lock.
     function shieldClaimGains() external nonReentrant {
-        uint256 current = _payGainsAndCompound(msg.sender);
+        uint256 current = _payGainsAndCompound(msg.sender, msg.sender);
+        _snapshot(msg.sender, current);
+    }
+
+    /// @notice As `shieldClaimGains`, paid to `to`.
+    function shieldClaimGainsTo(address to) external nonReentrant {
+        if (to == address(0)) revert ZeroAddress();
+        uint256 current = _payGainsAndCompound(msg.sender, to);
         _snapshot(msg.sender, current);
     }
 
@@ -501,7 +652,7 @@ contract NightshiftBackstop {
         unlocksAt = d.initial == 0 ? 0 : uint256(d.lastDepositAt) + SHIELD_MIN_LOCK;
     }
 
-    function _payGainsAndCompound(address account) internal returns (uint256 current) {
+    function _payGainsAndCompound(address account, address to) internal returns (uint256 current) {
         ShieldDeposit storage d = _shield[account];
         if (d.initial == 0) return 0;
         current = _compounded(d);
@@ -509,8 +660,8 @@ contract NightshiftBackstop {
         uint256 quoteGain = _gain(d, shieldG, d.snapshotG);
         // Snapshot before paying so a callback cannot claim twice.
         _snapshot(account, current);
-        if (tokenGain != 0) _send(token, account, tokenGain);
-        if (quoteGain != 0) _send(quote, account, quoteGain);
+        if (tokenGain != 0) _send(token, to, tokenGain);
+        if (quoteGain != 0) _send(quote, to, quoteGain);
         if (tokenGain != 0 || quoteGain != 0) emit ShieldGainsPaid(account, tokenGain, quoteGain);
     }
 
@@ -551,7 +702,8 @@ contract NightshiftBackstop {
         return UniV3Math.mulDiv(d.initial, first + second, d.snapshotP);
     }
 
-    /// @dev Spends `debt` quote of the Shield for `coll` tokens. `debt <= deposits / 2` by `_shieldLots`.
+    /// @dev Spends `debt` quote of the Shield for `coll` tokens. `debt <= deposits / 2`: reservations never
+    /// exceed half of the deposits (`_shieldLots`) and withdrawals keep it so (`_shieldWithdraw`).
     function _shieldAbsorb(uint256 debt, uint256 coll) internal {
         uint256 total = shieldTotalDeposits;
         uint256 p = shieldP;
