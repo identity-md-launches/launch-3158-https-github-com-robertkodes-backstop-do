@@ -11,6 +11,7 @@ contract BackstopHandler is Test {
     MockERC20 public immutable imd;
     MockERC20 public immutable usdc;
     MockPool public immutable pool;
+    MockPool public immutable altPool;
     address[4] public actors;
     address public immutable feeRecipient;
 
@@ -35,6 +36,13 @@ contract BackstopHandler is Test {
     uint256 public donatedQuote;
     uint256 public createdOffers;
     uint256 public createdBids;
+    uint256 public bidsWhilePaused;
+    uint256 public reservedWithdrawRejections;
+    uint256 public sourceRotations;
+    uint256 public shieldDeclinedReservations;
+    address public scheduledSource;
+    uint256 public scheduledAt;
+    mapping(uint256 => uint256) public reservedQuoteOf;
     mapping(uint256 => bytes32) public frozenTerms;
     mapping(uint256 => bytes32) public finalTerms;
     mapping(uint256 => bool) public sellerPaid;
@@ -52,6 +60,7 @@ contract BackstopHandler is Test {
         usdc = new MockERC20("USD Coin", "USDC", 6);
         backstop = new NightshiftBackstop(address(this), address(imd), address(usdc), 1_000e18, 10_000e6, 1e18);
         pool = new MockPool(address(imd), address(usdc));
+        altPool = new MockPool(address(imd), address(usdc));
         backstop.setPriceSource(address(pool));
         // At these ticks an 18-decimal IMD is worth a few 6-decimal USDC.
         _market(0, 0);
@@ -103,7 +112,9 @@ contract BackstopHandler is Test {
         uint256 limit = available < 20_000e18 ? available : 20_000e18;
         uint256 amount = bound(amountSeed, 1_000e18, limit);
         uint256 beforeBalance = imd.balanceOf(actor);
-        if (!_perform(actor, abi.encodeCall(backstop.createOffer, (amount)))) return;
+        uint256 reservedBefore = backstop.shieldReservedQuote();
+        uint256 usable = backstop.shieldTotalDeposits() / 2;
+        if (!_perform(actor, abi.encodeWithSignature("createOffer(uint256)", amount))) return;
         ++createdOffers;
         uint256 id = backstop.offerCount();
         NightshiftBackstop.Offer memory offer = backstop.getOffer(id);
@@ -113,10 +124,16 @@ contract BackstopHandler is Test {
         _check(offer.seller == actor && offer.deadline == block.timestamp + 1 hours, "wrong offer identity or deadline");
         _check(offer.lotSize * 100 == escrow && offer.lotCost != 0, "invalid offer terms");
         frozenTerms[id] = _terms(offer);
+        uint256 reserved = offer.shieldReservedLots * offer.lotCost;
+        reservedQuoteOf[id] = reserved;
+        _check(offer.shieldEligible || reserved == 0, "pump-filtered offer reserved Shield funds");
+        _check(offer.shieldReservedLots <= 50 && reserved <= 10_000e6, "reservation above per-offer limit");
+        _check(reservedBefore + reserved <= usable, "reservation exceeds uncommitted half of deposits");
+        _check(backstop.shieldReservedQuote() == reservedBefore + reserved, "reservation not recorded");
     }
 
     function bid(uint256 actorSeed, uint256 offerSeed, uint256 lotsSeed) public {
-        if (backstop.paused() || createdOffers == 0) return;
+        if (createdOffers == 0) return;
         uint256 id = bound(offerSeed, 1, createdOffers);
         NightshiftBackstop.Offer memory offer = backstop.getOffer(id);
         if (block.timestamp >= offer.deadline) return;
@@ -129,6 +146,7 @@ contract BackstopHandler is Test {
         uint256 beforeBalance = usdc.balanceOf(actor);
         if (!_perform(actor, abi.encodeCall(backstop.placeBid, (id, lots)))) return;
         ++createdBids;
+        if (backstop.paused()) ++bidsWhilePaused;
         uint256 bidId = backstop.bidCount();
         NightshiftBackstop.Bid memory placed = backstop.getBid(bidId);
         bidLots[bidId] = lots;
@@ -139,6 +157,16 @@ contract BackstopHandler is Test {
         quoteIn += lots * offer.lotCost;
         _check(beforeBalance - usdc.balanceOf(actor) == lots * offer.lotCost, "wrong bid charge");
         _check(placed.offerId == id && placed.bidder == actor, "wrong bid identity");
+    }
+
+    struct SettleSnapshot {
+        uint256 total;
+        uint256 tokens;
+        uint256 quote;
+        uint256 treasury;
+        uint256 reserved;
+        bool readable;
+        uint256 value;
     }
 
     function settle(uint256 offerSeed) public {
@@ -152,31 +180,55 @@ contract BackstopHandler is Test {
             return;
         }
         if (block.timestamp < beforeOffer.deadline) vm.warp(beforeOffer.deadline);
-        uint256 total = backstop.shieldTotalDeposits();
-        uint256 tokensBefore = imd.balanceOf(address(backstop));
-        uint256 quoteBefore = usdc.balanceOf(address(backstop));
-        uint256 treasuryBefore = backstop.treasuryAccrued();
+        SettleSnapshot memory pre;
+        pre.total = backstop.shieldTotalDeposits();
+        pre.tokens = imd.balanceOf(address(backstop));
+        pre.quote = usdc.balanceOf(address(backstop));
+        pre.treasury = backstop.treasuryAccrued();
+        pre.reserved = backstop.shieldReservedQuote();
+        pre.readable = !MockPool(backstop.priceSource()).broken();
+        pre.value = pre.readable ? backstop.twapLotValue(beforeOffer.lotSize) : 0;
         if (!_perform(_actor(offerSeed), abi.encodeCall(backstop.settle, (id)))) return;
         NightshiftBackstop.Offer memory offer = backstop.getOffer(id);
         finalTerms[id] = _settledTerms(offer);
         uint256 spent = offer.shieldLots * offer.lotCost;
         uint256 gross = (offer.shieldLots + offer.filledLots) * offer.lotCost;
         uint256 fee = gross - offer.sellerProceeds;
-        uint256 treasuryShare = backstop.treasuryAccrued() - treasuryBefore;
+        uint256 treasuryShare = backstop.treasuryAccrued() - pre.treasury;
         _check(fee * 10_000 >= gross * 300 && fee * 10_000 < gross * 300 + 10_000, "fee not rounded up to 3 percent");
-        _check(spent <= total / 2 && spent <= 10_000e6 && offer.shieldLots <= 50, "Shield spending limit exceeded");
-        _check(backstop.shieldTotalDeposits() == total - spent, "Shield spend not debited");
+        _check(spent <= pre.total / 2 && spent <= 10_000e6 && offer.shieldLots <= 50, "Shield spending limit exceeded");
+        _check(backstop.shieldTotalDeposits() == pre.total - spent, "Shield spend not debited");
         if (!offer.shieldEligible) _check(spent == 0, "pump filter bypassed");
+        _checkShieldSettlement(id, offer, pre, fee, treasuryShare);
         uint256 availableLots = 100 - offer.shieldLots;
         _check(offer.filledLots == (capacity[id] < availableLots ? capacity[id] : availableLots), "wrong total fill");
         _check(
-            tokensBefore == imd.balanceOf(address(backstop)) && quoteBefore == usdc.balanceOf(address(backstop)),
+            pre.tokens == imd.balanceOf(address(backstop)) && pre.quote == usdc.balanceOf(address(backstop)),
             "settlement transferred assets"
         );
         shieldSpent += spent;
         shieldTokensAllocated += offer.shieldLots * offer.lotSize;
         treasuryAllocated += treasuryShare;
         shieldFeesAllocated += fee - treasuryShare;
+    }
+
+    function _checkShieldSettlement(
+        uint256 id,
+        NightshiftBackstop.Offer memory offer,
+        SettleSnapshot memory pre,
+        uint256 fee,
+        uint256 treasuryShare
+    ) internal {
+        _check(
+            backstop.shieldReservedQuote() == pre.reserved - reservedQuoteOf[id],
+            "reservation not released at settlement"
+        );
+        // The Shield buys exactly its reservation, and only while the frozen price is at or below the TWAP.
+        bool buys = offer.shieldReservedLots != 0 && pre.readable && offer.lotCost <= pre.value;
+        _check(offer.shieldLots == (buys ? offer.shieldReservedLots : 0), "Shield bought other than its reservation");
+        if (offer.shieldReservedLots != 0 && !buys) ++shieldDeclinedReservations;
+        if (offer.shieldLots == 0) _check(treasuryShare == fee, "Shield earned fees without absorbing");
+        else _check(fee - treasuryShare <= fee * 8_000 / 10_000, "Shield fee share above 80 percent");
     }
 
     function claimSeller(uint256 offerSeed) public {
@@ -257,6 +309,7 @@ contract BackstopHandler is Test {
             _reject(actor, abi.encodeCall(backstop.shieldWithdraw, (amount)), NightshiftBackstop.ShieldLocked.selector);
             return;
         }
+        if (_reservationBlocks(actor, amount)) return;
         uint256 tokensBefore = imd.balanceOf(actor);
         uint256 quoteBefore = usdc.balanceOf(actor);
         if (!_perform(actor, abi.encodeCall(backstop.shieldWithdraw, (amount)))) return;
@@ -271,6 +324,18 @@ contract BackstopHandler is Test {
             imd.balanceOf(actor) == tokensBefore + tg && usdc.balanceOf(actor) == quoteBefore + qg + amount,
             "withdrawal paid wrong amount"
         );
+    }
+
+    /// @dev A withdrawal that would leave less than twice the open reservations must fail and change nothing.
+    function _reservationBlocks(address actor, uint256 amount) internal returns (bool) {
+        uint256 total = backstop.shieldTotalDeposits();
+        uint256 remaining = amount > total ? 0 : total - amount;
+        if (remaining / 2 >= backstop.shieldReservedQuote()) return false;
+        _reject(
+            actor, abi.encodeCall(backstop.shieldWithdraw, (amount)), NightshiftBackstop.ShieldFundsReserved.selector
+        );
+        ++reservedWithdrawRejections;
+        return true;
     }
 
     function claimGains(uint256 actorSeed) public {
@@ -336,11 +401,54 @@ contract BackstopHandler is Test {
     function changeMarket(int256 pastSeed, int256 nowSeed, bool broken) public {
         _market(int24(bound(pastSeed, -3_000, 3_000)), int24(bound(nowSeed, -3_000, 3_000)));
         pool.setBroken(broken);
+        altPool.setBroken(broken);
     }
 
     function _market(int24 pastMove, int24 nowMove) internal {
         int24 sign = address(imd) < address(usdc) ? int24(1) : int24(-1);
         pool.setTicks(sign * (-263819 + pastMove), sign * (-263819 + nowMove));
+        altPool.setTicks(sign * (-263819 + pastMove), sign * (-263819 + nowMove));
+    }
+
+    /// @notice Owner schedules, cancels or applies a replacement source; it can never take effect early.
+    function rotateSource(uint256 choice) public {
+        address current = backstop.priceSource();
+        address pending = backstop.pendingPriceSource();
+        uint256 action = choice % 3;
+        if (action == 0) {
+            address next = current == address(pool) ? address(altPool) : address(pool);
+            backstop.setPriceSource(next);
+            scheduledSource = next;
+            scheduledAt = block.timestamp;
+            _check(backstop.priceSource() == current, "replacement source took effect immediately");
+            _check(backstop.priceSourceActivatesAt() == block.timestamp + 37 days, "wrong activation time");
+        } else if (pending == address(0)) {
+            _reject(
+                address(this),
+                action == 1
+                    ? abi.encodeCall(backstop.applyPriceSource, ())
+                    : abi.encodeCall(backstop.cancelPriceSourceChange, ()),
+                NightshiftBackstop.NoPendingPriceSource.selector
+            );
+        } else if (action == 1) {
+            if (block.timestamp < scheduledAt + 37 days) {
+                _reject(
+                    address(this),
+                    abi.encodeCall(backstop.applyPriceSource, ()),
+                    NightshiftBackstop.PriceSourceDelayNotElapsed.selector
+                );
+                return;
+            }
+            if (!_perform(address(this), abi.encodeCall(backstop.applyPriceSource, ()))) return;
+            ++sourceRotations;
+            _check(backstop.priceSource() == scheduledSource, "applied wrong source");
+            scheduledSource = address(0);
+        } else {
+            if (!_perform(address(this), abi.encodeCall(backstop.cancelPriceSourceChange, ()))) return;
+            _check(backstop.priceSource() == current, "cancel changed source");
+            scheduledSource = address(0);
+        }
+        _check(backstop.pendingPriceSource() == scheduledSource, "pending source differs");
     }
 
     function pause(bool enabled) public {
@@ -370,7 +478,11 @@ contract BackstopHandler is Test {
     }
 
     function _terms(NightshiftBackstop.Offer memory o) internal pure returns (bytes32) {
-        return keccak256(abi.encode(o.seller, o.deadline, o.discountBps, o.shieldEligible, o.lotSize, o.lotCost));
+        return keccak256(
+            abi.encode(
+                o.seller, o.deadline, o.discountBps, o.shieldEligible, o.lotSize, o.lotCost, o.shieldReservedLots
+            )
+        );
     }
 
     function _settledTerms(NightshiftBackstop.Offer memory o) internal pure returns (bytes32) {
@@ -414,8 +526,10 @@ contract BackstopHandler is Test {
                 owedQuote += (placed.lots - n) * offer.lotCost;
             }
         }
+        uint256 openReservations;
         for (uint256 i = 1; i <= createdOffers; ++i) {
             NightshiftBackstop.Offer memory offer = backstop.getOffer(i);
+            if (!offer.settled) openReservations += offer.shieldReservedLots * offer.lotCost;
             assertEq(_terms(offer), frozenTerms[i], "offer repriced or identity changed");
             assertEq(offer.bidCapacity, capacity[i], "capacity differs from bids");
             assertEq(offer.sellerClaimed, sellerPaid[i], "seller claim state differs");
@@ -430,6 +544,11 @@ contract BackstopHandler is Test {
                 }
             }
         }
+        assertEq(backstop.shieldReservedQuote(), openReservations, "reserved quote differs from open reservations");
+        assertLe(
+            backstop.shieldReservedQuote(), backstop.shieldTotalDeposits() / 2, "reservations exceed half of deposits"
+        );
+        assertEq(backstop.pendingPriceSource(), scheduledSource, "pending source changed outside the owner");
         assertLe(shieldTokensPaid, shieldTokensAllocated, "excess Shield token payout");
         assertLe(shieldFeesPaid, shieldFeesAllocated, "excess Shield fee payout");
         assertEq(
@@ -470,6 +589,7 @@ contract BackstopHandler is Test {
     function closeAll() external {
         backstop.setPaused(true);
         pool.setBroken(true);
+        altPool.setBroken(true);
         vm.warp(block.timestamp + 31 days);
         for (uint256 i = 1; i <= createdOffers; ++i) {
             if (!backstop.getOffer(i).settled) settle(i);

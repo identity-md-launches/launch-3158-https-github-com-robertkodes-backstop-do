@@ -447,7 +447,7 @@ contract NightshiftFailurePathsTest is Test {
         _settle(id);
         uint256 callback = bound(callbackSeed, 0, 8);
         bytes memory data;
-        if (callback == 0) data = abi.encodeCall(b.createOffer, (AMOUNT));
+        if (callback == 0) data = abi.encodeWithSignature("createOffer(uint256)", AMOUNT);
         else if (callback == 1) data = abi.encodeCall(b.placeBid, (id, 1));
         else if (callback == 2) data = abi.encodeCall(b.settle, (id));
         else if (callback == 3) data = abi.encodeCall(b.claimSeller, (id));

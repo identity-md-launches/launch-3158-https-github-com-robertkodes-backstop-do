@@ -179,6 +179,9 @@ contract NightshiftEconomicPropertiesTest is Test {
         assertFalse(b.getOffer(pumped).shieldEligible);
         MockPool replacement = new MockPool(address(token), address(quote));
         b.setPriceSource(address(replacement));
+        // A replacement is only scheduled: open offers settle against the source they were priced by.
+        assertEq(b.priceSource(), address(pool));
+        assertEq(b.pendingPriceSource(), address(replacement));
         _settle(pumped);
         _settle(stable);
         assertEq(b.getOffer(pumped).shieldLots, 0);
@@ -187,7 +190,9 @@ contract NightshiftEconomicPropertiesTest is Test {
         assertEq(b.getOffer(stable).lotCost, 9.5e18);
     }
 
-    function test_zeroShieldCapStillDistributesBidFeesToDepositors() public {
+    /// @dev Revised design: a Shield that absorbs nothing earns no fee share, so idle or dust deposits
+    /// cannot farm fees paid by bidders; the whole fee is the treasury's.
+    function test_zeroShieldCapPaysBidFeesToTreasuryNotIdleDepositors() public {
         NightshiftBackstop zeroCap = new NightshiftBackstop(address(this), address(token), address(quote), 100, 0, 0);
         zeroCap.setPriceSource(address(pool));
         vm.startPrank(alice);
@@ -209,8 +214,9 @@ contract NightshiftEconomicPropertiesTest is Test {
         (uint256 dep, uint256 tg, uint256 qg,) = zeroCap.shieldPosition(alice);
         assertEq(dep, 1_000e18);
         assertEq(tg, 0);
-        assertEq(qg, 22.8e18);
-        assertEq(zeroCap.treasuryAccrued(), 5.7e18);
+        assertEq(qg, 0);
+        assertEq(zeroCap.getOffer(id).shieldReservedLots, 0);
+        assertEq(zeroCap.treasuryAccrued(), 28.5e18);
     }
 
     function test_joiningShieldAfterSettlementCannotClaimPastRewards() public {
